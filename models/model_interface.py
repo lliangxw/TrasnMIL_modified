@@ -29,6 +29,8 @@ class  ModelInterface(pl.LightningModule):
 
         self.val_step_outputs = []
         self.test_step_outputs = []
+        self.val_attn_loss_sum = torch.tensor(0.0, dtype=torch.float32)
+        self.val_attn_count = 0
 
         self.save_hyperparameters()
         self.load_model()
@@ -36,6 +38,9 @@ class  ModelInterface(pl.LightningModule):
         self.optimizer = optimizer
         self.n_classes = model.n_classes
         self.log_path = kargs['log']
+        self.use_attention_loss = bool(getattr(model, "use_attention_loss", True))
+        self.validate_attention_loss = bool(getattr(model, "validate_attention_loss", False))
+        self.attention_loss_weight = float(getattr(model, "attention_loss_weight", 50.0))
 
         #---->acc
         self.data = [{"count": 0, "correct": 0} for i in range(self.n_classes)]
@@ -81,8 +86,16 @@ class  ModelInterface(pl.LightningModule):
         items.pop("v_num", None)
         return items
 
-    def get_attention_loss(self, attns, heatmap, has_heatmap, header_attention, head_fusion='attn'):
-        return attention_loss(attns, heatmap, has_heatmap, header_attention, head_fusion)
+    def get_attention_loss(self, attns, heatmap_0, heatmap_1, has_heatmap_0, has_heatmap_1, header_attention, head_fusion='attn'):
+        return attention_loss(attns, heatmap_0, heatmap_1, has_heatmap_0, has_heatmap_1, header_attention, head_fusion)
+
+    def _sync_cuda(self, where):
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError as exc:
+                print(f"CUDA synchronize failed at {where}: {exc}", flush=True)
+                raise
 
     # def training_step(self, batch, batch_idx):
     #     #---->inference
@@ -141,33 +154,45 @@ class  ModelInterface(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):  ### Replacing the deleted training_step(self, batch, batch_idx)
 
-        lambda_attn = 0.0
-        data, label, slide_id, heatmap, has_heatmap = batch
-        results_dict, attns, h = self.model(data=data, label=label)
+        # data, label, slide_id, heatmap, has_heatmap = batch
+        data, label, slide_id, heatmap_0, heatmap_1, has_heatmap_0, has_heatmap_1 = batch
+        print(
+            f"train batch={batch_idx} slide={slide_id[0]} data_shape={tuple(data.shape)} "
+            f"use_attention_loss={self.use_attention_loss}",
+            flush=True,
+        )
+        results_dict, attns, h = self.model(data=data, label=label, return_attn=self.use_attention_loss)
+        self._sync_cuda("after training forward")
         logits = results_dict["logits"]
         Y_hat = results_dict["Y_hat"]
 
         # loss = self.loss(logits, label) + self.get_attention_loss(attns, heatmap, has_heatmap)
 
         cls_loss = self.loss(logits, label)
-        if has_heatmap == 1:
+        has_heatmap_0_int = int(has_heatmap_0)
+        has_heatmap_1_int = int(has_heatmap_1)
+        if self.use_attention_loss and (has_heatmap_0_int > 0 or has_heatmap_1_int > 0):
             _fc2_p = self.model._fc2.weight.detach()
-            header_attention = (h * _fc2_p).reshape((self.n_classes, 8, 64)).sum(dim=-1)[0,:]
+            if has_heatmap_0_int == 1 or has_heatmap_1_int == 1:
+                header_attention = (h * _fc2_p).reshape((self.n_classes, 8, 64)).sum(dim=-1)[0,:]  ### CCA
+            elif has_heatmap_0_int == 2 or has_heatmap_1_int == 2:
+                header_attention = (h * _fc2_p).reshape((self.n_classes, 8, 64)).sum(dim=-1)[1,:]  ### HCC
 
             if not torch.isfinite(header_attention).all():
                 print("header_attention invalid", header_attention[~torch.isfinite(header_attention)])
             if not torch.isfinite(h).all():
                 print("h invalid", torch.isnan(h).sum(), torch.isinf(h).sum())
 
-            attn_loss = self.get_attention_loss(attns, heatmap, has_heatmap, header_attention)
+            attn_loss = self.get_attention_loss(attns, heatmap_0, heatmap_1, has_heatmap_0_int, has_heatmap_1_int, header_attention)
             attn_loss = attn_loss.to(dtype=torch.float32)
-            loss = cls_loss + lambda_attn * attn_loss
+            loss = cls_loss + self.attention_loss_weight * attn_loss
         else:
             attn_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
             loss = cls_loss
+        self._sync_cuda("after training loss")
 
         print(f"cls_loss: {cls_loss.item():.6f}")
-        if has_heatmap == 1:
+        if self.use_attention_loss and (has_heatmap_0_int > 0 or has_heatmap_1_int > 0):
             print(f"attn_loss: {attn_loss.item():.6f}")
         print(f"total_loss: {loss.item():.6f}")
 
@@ -178,9 +203,17 @@ class  ModelInterface(pl.LightningModule):
         self.data[y_int]["correct"] += (y_hat_int == y_int)
 
         self.log("train_cls_loss", cls_loss, prog_bar=False, on_step=True, on_epoch=False, logger=True)
-        self.log("train_attn_loss", lambda_attn * attn_loss, prog_bar=False, on_step=True, on_epoch=False, logger=True)
+        self.log("train_attn_loss", self.attention_loss_weight * attn_loss, prog_bar=False, on_step=True, on_epoch=False, logger=True)
         self.log("train_total_loss", loss, prog_bar=True, on_step=True, on_epoch=False, logger=True)
         return loss
+
+    # def on_before_backward(self, loss):
+    #     print(f"before backward loss={float(loss.detach().cpu()):.6f}", flush=True)
+    #     self._sync_cuda("before backward")
+
+    # def on_after_backward(self):
+    #     self._sync_cuda("after backward")
+    #     print("after backward", flush=True)
 
     # def validation_step(self, batch, batch_idx):
     #     data, label, slide_id = batch
@@ -209,20 +242,42 @@ class  ModelInterface(pl.LightningModule):
     #     return {'logits' : logits, 'Y_prob' : Y_prob, 'Y_hat' : Y_hat, 'label' : label}
 
     def validation_step(self, batch, batch_idx): ### Replacing the deleted validation_step(self, batch, batch_idx)
-        lambda_attn = 0.0
-        data, label, slide_id, heatmap, has_heatmap = batch
-        results_dict, attns, h = self.model(data=data, label=label)
+
+        data, label, slide_id, heatmap_0, heatmap_1, has_heatmap_0, has_heatmap_1 = batch
+        print(
+            f"val batch={batch_idx} slide={slide_id[0]} data_shape={tuple(data.shape)} "
+            f"validate_attention_loss={self.validate_attention_loss}",
+            flush=True,
+        )
+        results_dict, attns, h = self.model(data=data, label=label, return_attn=self.validate_attention_loss)
+        self._sync_cuda("after validation forward")
         logits = results_dict["logits"]
         Y_prob = results_dict["Y_prob"]
         Y_hat = results_dict["Y_hat"]
 
-        # logits = logits.detach().cpu()
-        # Y_prob = Y_prob.detach().cpu()
-        # Y_hat = Y_hat.detach().cpu()
-        # label = label.detach().cpu()
-        heatmap = heatmap.detach().cpu()
-        attns = [attn.detach().cpu() for attn in attns]
-        h = h.detach().cpu()
+        has_heatmap_0_int = int(has_heatmap_0)
+        has_heatmap_1_int = int(has_heatmap_1)
+        if self.use_attention_loss and self.validate_attention_loss and (has_heatmap_0_int > 0 or has_heatmap_1_int > 0):
+            _fc2_p = self.model._fc2.weight.detach()
+            if has_heatmap_0_int == 1 or has_heatmap_1_int == 1:
+                header_attention = (h * _fc2_p).reshape(self.n_classes, 8, 64).sum(dim=-1)[0, :]
+            elif has_heatmap_0_int == 2 or has_heatmap_1_int == 2:
+                header_attention = (h * _fc2_p).reshape(self.n_classes, 8, 64).sum(dim=-1)[1, :]
+
+            sample_attn_loss = self.get_attention_loss(
+                attns,
+                heatmap_0,
+                heatmap_1,
+                has_heatmap_0_int,
+                has_heatmap_1_int,
+                header_attention,
+            ).detach().to(dtype=torch.float32).cpu()
+
+            if torch.isfinite(sample_attn_loss):
+                self.val_attn_loss_sum += sample_attn_loss
+                self.val_attn_count += 1
+            else:
+                print("Skipping non-finite validation attention loss for this sample")
 
         incorrect_mask = (Y_hat != label)
         incorrect_ids = [slide_id[i] for i in range(len(slide_id)) if incorrect_mask[i]]
@@ -236,7 +291,12 @@ class  ModelInterface(pl.LightningModule):
         self.data_test[y_int]["count"] += 1
         self.data_test[y_int]["correct"] += (Y_hat.item() == y_int)
 
-        out = {"logits": logits, "Y_prob": Y_prob, "Y_hat": Y_hat, "label": label, "heatmap": heatmap, "has_heatmap": has_heatmap, "attns": attns, "h": h}
+        out = {
+            "logits": logits.detach().cpu(),
+            "Y_prob": Y_prob.detach().cpu(),
+            "Y_hat": Y_hat.detach().cpu(),
+            "label": label.detach().cpu(),
+        }
         self.val_step_outputs.append(out)
         return out
 
@@ -280,55 +340,26 @@ class  ModelInterface(pl.LightningModule):
         if len(self.val_step_outputs) == 0:
             return
 
-        lambda_attn = 0.0
         logits = torch.cat([x["logits"] for x in self.val_step_outputs], dim=0)
         probs = torch.cat([x["Y_prob"] for x in self.val_step_outputs], dim=0)
         max_probs = torch.stack([x["Y_hat"] for x in self.val_step_outputs])
         target = torch.stack([x["label"] for x in self.val_step_outputs], dim=0)
 
         cls_val_loss = cross_entropy_torch(logits, target).detach().cpu()
-        attn_loss = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
-        attn_count = 0
-        _fc2_p = self.model._fc2.weight.detach()
-
-        for i in range(len(self.val_step_outputs)):
-            output = self.val_step_outputs[i]
-            has_heatmap = int(output["has_heatmap"])
-            if has_heatmap == 1:
-                h = output["h"]
-                header_attention = (h * _fc2_p).reshape(self.n_classes, 8, 64).sum(dim=-1)[0, :]
-
-                if not torch.isfinite(header_attention).all():
-                    print("header_attention invalid", header_attention[~torch.isfinite(header_attention)])
-                if not torch.isfinite(output["attns"][0]).all():
-                    print("attn tensor invalid", output["attns"][0].shape,
-                        output["attns"][0].min(), output["attns"][0].max(),
-                        torch.isnan(output["attns"][0]).sum(), torch.isinf(output["attns"][0]).sum())
-
-                sample_attn_loss = self.get_attention_loss(
-                    output["attns"],
-                    output["heatmap"],
-                    has_heatmap,
-                    header_attention,
-                )
-                sample_attn_loss = sample_attn_loss.to(dtype=torch.float32)
-                if not torch.isfinite(sample_attn_loss):
-                    print("Skipping non-finite validation attention loss for this sample")
-                    continue
-                attn_loss = attn_loss + sample_attn_loss
-                attn_count += 1
-
-        if attn_count > 0:
-            attn_loss = attn_loss / attn_count
+        attn_loss = torch.tensor(0.0, dtype=torch.float32)
+        if self.val_attn_count > 0:
+            attn_loss = self.val_attn_loss_sum / self.val_attn_count
 
         print(f"validation cls_loss: {cls_val_loss.item():.6f}")
-        if attn_count > 0:
+        if self.val_attn_count > 0:
             print(f"validation attn_loss: {attn_loss.item():.6f}")
-        print(f"validation total_loss: {(cls_val_loss + lambda_attn * attn_loss).item():.6f}")
+        print(f"validation total_loss: {(cls_val_loss + self.attention_loss_weight * attn_loss).item():.6f}")
         self.log("val_cls_loss", cls_val_loss, prog_bar=False, on_epoch=True, logger=True)
-        self.log("val_attn_loss", lambda_attn * attn_loss, prog_bar=False, on_epoch=True, logger=True)
-        self.log("val_loss", cls_val_loss + lambda_attn * attn_loss, prog_bar=True, on_epoch=True, logger=True)
-        self.log_dict(self.valid_metrics(max_probs.squeeze(), target.squeeze()),
+        self.log("val_attn_loss", self.attention_loss_weight * attn_loss, prog_bar=False, on_epoch=True, logger=True)
+        self.log("val_loss", cls_val_loss + self.attention_loss_weight * attn_loss, prog_bar=True, on_epoch=True, logger=True)
+        metric_preds = max_probs.squeeze().to(self.device)
+        metric_target = target.squeeze().to(self.device)
+        self.log_dict(self.valid_metrics(metric_preds, metric_target),
                     on_epoch=True, logger=True)
 
         for c in range(self.n_classes):
@@ -343,6 +374,8 @@ class  ModelInterface(pl.LightningModule):
             random.seed(self.count * 50)
 
         self.val_step_outputs.clear()
+        self.val_attn_loss_sum = torch.tensor(0.0, dtype=torch.float32)
+        self.val_attn_count = 0
 
     def configure_optimizers(self):
         optimizer = create_optimizer(self.optimizer, self.model)
